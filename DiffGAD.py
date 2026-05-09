@@ -1,3 +1,4 @@
+import os
 import copy
 import math
 from pathlib import Path
@@ -14,7 +15,6 @@ from auto_encoder import GraphAE
 from diffusion_model import MLPDiffusion, Model, sample_dm_free
 from pygod.metric.metric import eval_average_precision, eval_recall_at_k, eval_roc_auc
 from utils import extract, get_noises, load_mat_data, softmax_with_temperature
-
 
 sqrt_alphas_cumprod, sqrt_one_minus_alphas_cumprod = get_noises(timesteps=500)
 
@@ -38,7 +38,6 @@ class DiffGAD(BaseTransform):
         proto_alpha=None,
         data_dir="~/datasets/GAD/mat",
         save_dir="checkpoints",
-        save_ckpt=False,
         num_trials=20,
         device=0,
     ):
@@ -63,9 +62,11 @@ class DiffGAD(BaseTransform):
         self.timesteps = 500
         self.data_dir = data_dir
         self.save_dir_root = Path(save_dir)
-        self.save_ckpt = save_ckpt
         self.num_trials = num_trials
-        self.device = torch.device("cpu" if device < 0 or not torch.cuda.is_available() else "cuda")
+        self.device = torch.device(
+            "cpu" if device < 0 or not torch.cuda.is_available() else "cuda"
+        )
+        os.makedirs(self.save_dir_root, exist_ok=True)
 
     def forward(self, dset):
         self.dataset = dset
@@ -82,44 +83,39 @@ class DiffGAD(BaseTransform):
             dropout=self.ae_dropout,
         ).to(self.device)
 
-        ae_state = self.train_ae(data)
-        self.ae.load_state_dict(ae_state)
-
         dm_auc, dm_ap, dm_rec, dm_auprc = [], [], [], []
         final_state = None
 
         trial_bar = tqdm(range(self.num_trials), desc="Trials", dynamic_ncols=True)
         for _ in trial_bar:
+            # AE 只训练一次
+            self.train_ae(data)
+
+            # DM
             denoise_fn = MLPDiffusion(self.hid_dim, self.diff_dim).to(self.device)
             self.dm = Model(denoise_fn=denoise_fn, hid_dim=self.hid_dim).to(self.device)
-            dm_state, self.proto = self.train_dm(data)
-            self.dm.load_state_dict(dm_state)
+            self.proto = self.train_dm(data)
 
+            # Proto-DM
             denoise_proto = MLPDiffusion(self.hid_dim, self.diff_dim).to(self.device)
-            self.dm_proto = Model(denoise_fn=denoise_proto, hid_dim=self.hid_dim).to(self.device)
-            proto_dm_state = self.train_dm_proto(data)
-            self.dm_proto.load_state_dict(proto_dm_state)
+            self.dm_proto = Model(denoise_fn=denoise_proto, hid_dim=self.hid_dim).to(
+                self.device
+            )
+            self.train_dm_proto(data)
 
-            auc_this, ap_this, rec_this, auprc_this = self.sample(self.dm_proto, self.dm, data)
+            # 计算指标
+            auc_this, ap_this, rec_this, auprc_this = self.sample(
+                self.dm_proto, self.dm, data
+            )
             dm_auc.append(auc_this)
             dm_ap.append(ap_this)
             dm_rec.append(rec_this)
             dm_auprc.append(auprc_this)
-            trial_bar.set_postfix(auc=f"{auc_this:.4f}", ap=f"{ap_this:.4f}", rec=f"{rec_this:.4f}")
+            trial_bar.set_postfix(
+                auc=f"{auc_this:.4f}", ap=f"{ap_this:.4f}", rec=f"{rec_this:.4f}"
+            )
 
-            final_state = {
-                "ae": copy.deepcopy(self.ae.state_dict()),
-                "dm": copy.deepcopy(self.dm.state_dict()),
-                "dm_proto": copy.deepcopy(self.dm_proto.state_dict()),
-                "prototype": self.proto.detach().cpu() if torch.is_tensor(self.proto) else self.proto,
-                "params": self._params_dict(),
-            }
-
-        if self.save_ckpt and final_state is not None:
-            save_dir = self.save_dir_root / str(self.dataset)
-            save_dir.mkdir(parents=True, exist_ok=True)
-            torch.save(final_state, save_dir / "best.pt")
-
+        # 输出最终平均值和标准差
         dm_auc = torch.tensor(dm_auc)
         dm_ap = torch.tensor(dm_ap)
         dm_rec = torch.tensor(dm_rec)
@@ -130,55 +126,71 @@ class DiffGAD(BaseTransform):
             "Final AP: {:.4f}±{:.4f} ({:.4f})\t"
             "Final Recall: {:.4f}±{:.4f} ({:.4f})\t"
             "Final AUPRC: {:.4f}±{:.4f} ({:.4f})".format(
-                torch.mean(dm_auc), torch.std(dm_auc), torch.max(dm_auc),
-                torch.mean(dm_ap), torch.std(dm_ap), torch.max(dm_ap),
-                torch.mean(dm_rec), torch.std(dm_rec), torch.max(dm_rec),
-                torch.mean(dm_auprc), torch.std(dm_auprc), torch.max(dm_auprc),
+                torch.mean(dm_auc),
+                torch.std(dm_auc),
+                torch.max(dm_auc),
+                torch.mean(dm_ap),
+                torch.std(dm_ap),
+                torch.max(dm_ap),
+                torch.mean(dm_rec),
+                torch.std(dm_rec),
+                torch.max(dm_rec),
+                torch.mean(dm_auprc),
+                torch.std(dm_auprc),
+                torch.max(dm_auprc),
             )
         )
 
     def train_ae(self, data):
-        optimizer = torch.optim.Adam(self.ae.parameters(), self.ae_lr, weight_decay=0.01)
+        optimizer = torch.optim.Adam(
+            self.ae.parameters(), self.ae_lr, weight_decay=0.01
+        )
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
-        auc_list, ap_list, rec_list, states = [], [], [], []
 
-        trials = tqdm(range(self.num_trials), desc="AE trials", dynamic_ncols=True, leave=False)
-        for _ in trials:
-            epochs = tqdm(range(1, self.ae_epochs + 1), desc="AE epochs", dynamic_ncols=True, leave=False)
-            last_auc = last_ap = last_rec = 0.0
-            for epoch in epochs:
-                self.ae.train()
-                x = data.x.to(self.device, dtype=torch.float32)
-                edge_index = data.edge_index.to(self.device)
-                y = data.y.bool()
-                s = to_dense_adj(edge_index)[0].to(self.device)
+        epochs = tqdm(
+            range(1, self.ae_epochs + 1),
+            desc="AE epochs",
+            dynamic_ncols=True,
+            leave=False,
+        )
+        last_auc = last_ap = last_rec = 0.0
+        best_auc = 0
+        # for _ in range(5)
+        for epoch in epochs:
+            self.ae.train()
+            x = data.x.to(self.device, dtype=torch.float32)
+            edge_index = data.edge_index.to(self.device)
+            y = data.y.bool()
+            s = to_dense_adj(edge_index)[0].to(self.device)
 
-                x_, s_, _ = self.ae(x, edge_index)
-                score = self.ae.loss_func(x, x_, s, s_, self.ae_alpha)
-                loss = torch.mean(score)
+            x_, s_, _ = self.ae(x, edge_index)
+            score = self.ae.loss_func(x, x_, s, s_, self.ae_alpha)
+            loss = torch.mean(score)
 
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.ae.parameters(), 1.0)
-                optimizer.step()
-                scheduler.step()
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.ae.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
 
-                last_auc = eval_roc_auc(y, score.detach().cpu())
-                last_ap = eval_average_precision(y, score.detach().cpu())
-                last_rec = eval_recall_at_k(y, score.detach().cpu(), int(sum(y)))
-                epochs.set_postfix(loss=f"{loss.item():.5f}", auc=f"{last_auc:.4f}")
+            last_auc = eval_roc_auc(y, score.detach().cpu())
+            last_ap = eval_average_precision(y, score.detach().cpu())
+            last_rec = eval_recall_at_k(y, score.detach().cpu(), int(sum(y)))
+            epochs.set_postfix(loss=f"{loss.item():.5f}", auc=f"{last_auc:.4f}")
 
-            auc_list.append(last_auc)
-            ap_list.append(last_ap)
-            rec_list.append(last_rec)
-            states.append(copy.deepcopy(self.ae.state_dict()))
-            trials.set_postfix(auc=f"{last_auc:.4f}", ap=f"{last_ap:.4f}", rec=f"{last_rec:.4f}")
+            if last_auc > best_auc:
+                torch.save(self.ae, os.path.join(self.save_dir_root, "ae.pt"))
+                best_auc = last_auc
 
-        best_id = int(np.argmax(auc_list))
-        return states[best_id]
+        self.ae = torch.load(
+            os.path.join(self.save_dir_root, "ae.pt"), weights_only=False
+        )
+        return
 
     def train_dm(self, data):
-        optimizer = torch.optim.Adam(self.dm.parameters(), lr=self.lr, weight_decay=self.wd)
+        optimizer = torch.optim.Adam(
+            self.dm.parameters(), lr=self.lr, weight_decay=self.wd
+        )
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
         self.dm.train()
         best_loss = float("inf")
@@ -187,7 +199,9 @@ class DiffGAD(BaseTransform):
         best_state = copy.deepcopy(self.dm.state_dict())
         best_proto = None
 
-        epochs = tqdm(range(self.diff_epochs), desc="DM epochs", dynamic_ncols=True, leave=False)
+        epochs = tqdm(
+            range(self.diff_epochs), desc="DM epochs", dynamic_ncols=True, leave=False
+        )
         for epoch in epochs:
             x = data.x.to(self.device, dtype=torch.float32)
             edge_index = data.edge_index.to(self.device)
@@ -214,29 +228,40 @@ class DiffGAD(BaseTransform):
             if loss.item() < best_loss:
                 best_loss = loss.item()
                 patience = 0
-                best_state = copy.deepcopy(self.dm.state_dict())
+                torch.save(self.dm, os.path.join(self.save_dir_root, "dm.pt"))
                 best_proto = proto.detach().clone()
             else:
                 patience += 1
                 if patience == self.patience:
                     break
 
-        return best_state, best_proto
+        self.dm = torch.load(
+            os.path.join(self.save_dir_root, "dm.pt"), weights_only=False
+        )
+        return best_proto
 
     def train_dm_proto(self, data):
-        optimizer = torch.optim.Adam(self.dm_proto.parameters(), lr=self.lr, weight_decay=self.wd)
+        optimizer = torch.optim.Adam(
+            self.dm_proto.parameters(), lr=self.lr, weight_decay=self.wd
+        )
         scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=100, gamma=0.5)
         self.dm_proto.train()
         best_loss = float("inf")
         patience = 0
-        best_state = copy.deepcopy(self.dm_proto.state_dict())
 
-        epochs = tqdm(range(self.diff_epochs), desc="Proto-DM epochs", dynamic_ncols=True, leave=False)
+        epochs = tqdm(
+            range(self.diff_epochs),
+            desc="Proto-DM epochs",
+            dynamic_ncols=True,
+            leave=False,
+        )
         for _ in epochs:
             x = data.x.to(self.device, dtype=torch.float32)
             edge_index = data.edge_index.to(self.device)
             inputs = self.ae.encode(x, edge_index)
-            loss, _, _ = self.dm_proto(inputs, proto=self.proto, proto_alpha=self.proto_alpha)
+            loss, _, _ = self.dm_proto(
+                inputs, proto=self.proto, proto_alpha=self.proto_alpha
+            )
             loss = loss.mean()
 
             optimizer.zero_grad()
@@ -249,13 +274,18 @@ class DiffGAD(BaseTransform):
             if loss.item() < best_loss:
                 best_loss = loss.item()
                 patience = 0
-                best_state = copy.deepcopy(self.dm_proto.state_dict())
+                torch.save(
+                    self.dm_proto, os.path.join(self.save_dir_root, "dm_proto.pt")
+                )
             else:
                 patience += 1
                 if patience == self.patience:
                     break
 
-        return best_state
+        self.dm_proto = torch.load(
+            os.path.join(self.save_dir_root, "dm_proto.pt"), weights_only=False
+        )
+        return
 
     def sample(self, proto_model, free_model, data):
         self.ae.eval()
@@ -271,13 +301,22 @@ class DiffGAD(BaseTransform):
         noise = torch.randn_like(z_0)
 
         auc_pygod, ap, rec, auprc = [], [], [], []
-        timesteps = tqdm(range(self.timesteps), desc="Sampling", dynamic_ncols=True, leave=False)
+        timesteps = tqdm(
+            range(self.timesteps), desc="Sampling", dynamic_ncols=True, leave=False
+        )
         with torch.no_grad():
             for i in timesteps:
-                t = torch.tensor([i] * z_0.size(0), dtype=torch.long, device=self.device)
+                t = torch.tensor(
+                    [i] * z_0.size(0), dtype=torch.long, device=self.device
+                )
                 sqrt_alphas_cumprod_t = extract(sqrt_alphas_cumprod, t, z_0.shape)
-                sqrt_one_minus_alphas_cumprod_t = extract(sqrt_one_minus_alphas_cumprod, t, z_0.shape)
-                z_t = sqrt_alphas_cumprod_t * z_0 + sqrt_one_minus_alphas_cumprod_t * noise
+                sqrt_one_minus_alphas_cumprod_t = extract(
+                    sqrt_one_minus_alphas_cumprod, t, z_0.shape
+                )
+                z_t = (
+                    sqrt_alphas_cumprod_t * z_0
+                    + sqrt_one_minus_alphas_cumprod_t * noise
+                )
 
                 reconstructed = sample_dm_free(
                     proto_net,
@@ -295,14 +334,18 @@ class DiffGAD(BaseTransform):
                 pyg_auc = eval_roc_auc(y, score.detach().cpu())
                 pyg_ap = eval_average_precision(y, score.detach().cpu())
                 pyg_rec = eval_recall_at_k(y, score.detach().cpu(), int(sum(y)))
-                p, r, _ = precision_recall_curve(y.numpy(), score.detach().cpu().numpy())
+                p, r, _ = precision_recall_curve(
+                    y.numpy(), score.detach().cpu().numpy()
+                )
                 pyg_auprc = auc(r, p)
 
                 auc_pygod.append(pyg_auc)
                 ap.append(pyg_ap)
                 rec.append(pyg_rec)
                 auprc.append(pyg_auprc)
-                timesteps.set_postfix(auc=f"{pyg_auc:.4f}", ap=f"{pyg_ap:.4f}", rec=f"{pyg_rec:.4f}")
+                timesteps.set_postfix(
+                    auc=f"{pyg_auc:.4f}", ap=f"{pyg_ap:.4f}", rec=f"{pyg_rec:.4f}"
+                )
 
         return np.max(auc_pygod), np.max(ap), np.max(rec), np.max(auprc)
 
